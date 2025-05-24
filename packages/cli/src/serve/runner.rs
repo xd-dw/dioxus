@@ -74,7 +74,7 @@ pub(crate) struct AppServer {
     pub(crate) cross_origin_policy: bool,
 
     // Additional plugin-type tools
-    pub(crate) _tw_watcher: tokio::task::JoinHandle<Result<()>>,
+    pub(crate) tw_watcher: tokio::task::JoinHandle<Result<()>>,
 }
 
 pub(crate) struct CachedFile {
@@ -155,10 +155,12 @@ impl AppServer {
             client.build.package_manifest_dir(),
             client.build.config.application.tailwind_input.clone(),
             client.build.config.application.tailwind_output.clone(),
-        )
-        .await?;
+        );
 
-        tracing::debug!("Proxied port: {:?}", proxied_port);
+        _ = client.build.start_simulators().await;
+
+        // Encourage the user to update to a new dx version
+        crate::update::log_if_cli_could_update();
 
         // Create the runner
         let mut runner = Self {
@@ -184,7 +186,7 @@ impl AppServer {
             _force_sequential: force_sequential,
             cross_origin_policy,
             fullstack,
-            _tw_watcher: tw_watcher,
+            tw_watcher,
         };
 
         // Only register the hot-reload stuff if we're watching the filesystem
@@ -339,14 +341,14 @@ impl AppServer {
                     continue;
                 };
 
+                // Update the most recent version of the file, so when we force a rebuild, we keep operating on the most recent version
+                cached_file.most_recent = Some(new_contents);
+
                 // This assumes the two files are structured similarly. If they're not, we can't diff them
                 let Some(changed_rsx) = dioxus_rsx_hotreload::diff_rsx(&new_file, &old_file) else {
                     needs_full_rebuild = true;
                     break;
                 };
-
-                // Update the most recent version of the file, so when we force a rebuild, we keep operating on the most recent version
-                cached_file.most_recent = Some(new_contents);
 
                 for ChangedRsx { old, new } in changed_rsx {
                     let old_start = old.span().start();
@@ -446,7 +448,13 @@ impl AppServer {
             // Also make sure the builder isn't busy since that might cause issues with hotreloads
             // https://github.com/DioxusLabs/dioxus/issues/3361
             if !msg.is_empty() && self.client.can_receive_hotreloads() {
-                tracing::info!(dx_src = ?TraceSrc::Dev, "Hotreloading: {}", file);
+                use crate::styles::NOTE_STYLE;
+                tracing::info!(dx_src = ?TraceSrc::Dev, "Hotreloading: {NOTE_STYLE}{}{NOTE_STYLE:#}", file);
+
+                if !server.has_hotreload_sockets() && self.client.build.platform != Platform::Web {
+                    tracing::warn!("No clients to hotreload - try reloading the app!");
+                }
+
                 server.send_hotreload(msg).await;
             } else {
                 tracing::debug!(dx_src = ?TraceSrc::Dev, "Ignoring file change: {}", file);
@@ -473,6 +481,8 @@ impl AppServer {
         let should_open = self.client.stage == BuildStage::Success
             && (self.server.as_ref().map(|s| s.stage == BuildStage::Success)).unwrap_or(true);
 
+        use crate::cli::styles::GLOW_STYLE;
+
         if should_open {
             let time_taken = artifacts
                 .time_end
@@ -481,11 +491,14 @@ impl AppServer {
 
             if self.client.builds_opened == 0 {
                 tracing::info!(
-                    "Build completed successfully in {:?}ms, launching app! 💫",
+                    "Build completed successfully in {GLOW_STYLE}{:?}ms{GLOW_STYLE:#}, launching app! 💫",
                     time_taken.as_millis()
                 );
             } else {
-                tracing::info!("Build completed in {:?}ms", time_taken.as_millis());
+                tracing::info!(
+                    "Build completed in {GLOW_STYLE}{:?}ms{GLOW_STYLE:#}",
+                    time_taken.as_millis()
+                );
             }
 
             let open_browser = self.client.builds_opened == 0 && self.open_browser;
@@ -551,7 +564,7 @@ impl AppServer {
     }
 
     /// Shutdown all the running processes
-    pub(crate) async fn cleanup_all(&mut self) -> Result<()> {
+    pub(crate) async fn shutdown(&mut self) -> Result<()> {
         self.client.soft_kill().await;
 
         if let Some(server) = self.server.as_mut() {
@@ -574,6 +587,9 @@ impl AppServer {
                 );
             }
         }
+
+        // force the tailwind watcher to stop - if we don't, it eats our stdin
+        self.tw_watcher.abort();
 
         Ok(())
     }
@@ -676,6 +692,7 @@ impl AppServer {
         &mut self,
         build_id: BuildId,
         aslr_reference: Option<u64>,
+        pid: Option<u32>,
     ) {
         match build_id {
             BuildId::CLIENT => {
@@ -684,6 +701,9 @@ impl AppServer {
                 if self.client.build.platform != Platform::Web {
                     if let Some(aslr_reference) = aslr_reference {
                         self.client.aslr_reference = Some(aslr_reference);
+                    }
+                    if let Some(pid) = pid {
+                        self.client.pid = Some(pid);
                     }
                 }
             }
@@ -953,6 +973,24 @@ impl AppServer {
         };
 
         server.compiled_crates as f64 / server.expected_crates as f64
+    }
+
+    pub(crate) async fn open_debugger(&mut self, dev: &WebServer, build: BuildId) {
+        if self.use_hotpatch_engine {
+            tracing::warn!("Debugging symbols might not work properly with hotpatching enabled. Consider disabling hotpatching for debugging.");
+        }
+
+        match build {
+            BuildId::CLIENT => {
+                _ = self.client.open_debugger(dev).await;
+            }
+            BuildId::SERVER => {
+                if let Some(server) = self.server.as_mut() {
+                    _ = server.open_debugger(dev).await;
+                }
+            }
+            _ => {}
+        }
     }
 }
 
