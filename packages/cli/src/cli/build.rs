@@ -43,7 +43,7 @@ pub struct BuildArgs {
     ///
     /// Server and Client are special targets that integrate with `dx serve`, while `crate` is a generic.
     ///
-    /// ```
+    /// ```sh
     /// dx serve \
     ///     client --target aarch64-apple-darwin \
     ///     server --target wasm32-unknown-unknown \
@@ -88,6 +88,9 @@ impl BuildArgs {
 
     pub async fn into_targets(self) -> Result<BuildTargets> {
         let workspace = Workspace::current().await?;
+
+        // do some logging to ensure dx matches the dioxus version since we're not always API compatible
+        workspace.check_dioxus_version_against_cli();
 
         let mut server = None;
 

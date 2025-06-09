@@ -74,7 +74,7 @@ pub(crate) struct AppServer {
     pub(crate) cross_origin_policy: bool,
 
     // Additional plugin-type tools
-    pub(crate) _tw_watcher: tokio::task::JoinHandle<Result<()>>,
+    pub(crate) tw_watcher: tokio::task::JoinHandle<Result<()>>,
 }
 
 pub(crate) struct CachedFile {
@@ -155,10 +155,12 @@ impl AppServer {
             client.build.package_manifest_dir(),
             client.build.config.application.tailwind_input.clone(),
             client.build.config.application.tailwind_output.clone(),
-        )
-        .await?;
+        );
 
-        tracing::debug!("Proxied port: {:?}", proxied_port);
+        _ = client.build.start_simulators().await;
+
+        // Encourage the user to update to a new dx version
+        crate::update::log_if_cli_could_update();
 
         // Create the runner
         let mut runner = Self {
@@ -184,7 +186,7 @@ impl AppServer {
             _force_sequential: force_sequential,
             cross_origin_policy,
             fullstack,
-            _tw_watcher: tw_watcher,
+            tw_watcher,
         };
 
         // Only register the hot-reload stuff if we're watching the filesystem
@@ -307,8 +309,10 @@ impl AppServer {
 
             // If it's an asset, we want to hotreload it
             // todo(jon): don't hardcode this here
-            if let Some(bundled_name) = self.client.hotreload_bundled_asset(path).await {
-                assets.push(PathBuf::from("/assets/").join(bundled_name));
+            if let Some(bundled_names) = self.client.hotreload_bundled_assets(path).await {
+                for bundled_name in bundled_names {
+                    assets.push(PathBuf::from("/assets/").join(bundled_name));
+                }
             }
 
             // If it's a rust file, we want to hotreload it using the filemap
@@ -339,14 +343,14 @@ impl AppServer {
                     continue;
                 };
 
+                // Update the most recent version of the file, so when we force a rebuild, we keep operating on the most recent version
+                cached_file.most_recent = Some(new_contents);
+
                 // This assumes the two files are structured similarly. If they're not, we can't diff them
                 let Some(changed_rsx) = dioxus_rsx_hotreload::diff_rsx(&new_file, &old_file) else {
                     needs_full_rebuild = true;
                     break;
                 };
-
-                // Update the most recent version of the file, so when we force a rebuild, we keep operating on the most recent version
-                cached_file.most_recent = Some(new_contents);
 
                 for ChangedRsx { old, new } in changed_rsx {
                     let old_start = old.span().start();
@@ -431,6 +435,7 @@ impl AppServer {
                 ms_elapsed: 0,
                 jump_table: Default::default(),
                 for_build_id: None,
+                for_pid: None,
             };
 
             self.add_hot_reload_message(&msg);
@@ -446,7 +451,13 @@ impl AppServer {
             // Also make sure the builder isn't busy since that might cause issues with hotreloads
             // https://github.com/DioxusLabs/dioxus/issues/3361
             if !msg.is_empty() && self.client.can_receive_hotreloads() {
-                tracing::info!(dx_src = ?TraceSrc::Dev, "Hotreloading: {}", file);
+                use crate::styles::NOTE_STYLE;
+                tracing::info!(dx_src = ?TraceSrc::Dev, "Hotreloading: {NOTE_STYLE}{}{NOTE_STYLE:#}", file);
+
+                if !server.has_hotreload_sockets() && self.client.build.platform != Platform::Web {
+                    tracing::warn!("No clients to hotreload - try reloading the app!");
+                }
+
                 server.send_hotreload(msg).await;
             } else {
                 tracing::debug!(dx_src = ?TraceSrc::Dev, "Ignoring file change: {}", file);
@@ -473,6 +484,8 @@ impl AppServer {
         let should_open = self.client.stage == BuildStage::Success
             && (self.server.as_ref().map(|s| s.stage == BuildStage::Success)).unwrap_or(true);
 
+        use crate::cli::styles::GLOW_STYLE;
+
         if should_open {
             let time_taken = artifacts
                 .time_end
@@ -481,11 +494,14 @@ impl AppServer {
 
             if self.client.builds_opened == 0 {
                 tracing::info!(
-                    "Build completed successfully in {:?}ms, launching app! 💫",
+                    "Build completed successfully in {GLOW_STYLE}{:?}ms{GLOW_STYLE:#}, launching app! 💫",
                     time_taken.as_millis()
                 );
             } else {
-                tracing::info!("Build completed in {:?}ms", time_taken.as_millis());
+                tracing::info!(
+                    "Build completed in {GLOW_STYLE}{:?}ms{GLOW_STYLE:#}",
+                    time_taken.as_millis()
+                );
             }
 
             let open_browser = self.client.builds_opened == 0 && self.open_browser;
@@ -551,7 +567,7 @@ impl AppServer {
     }
 
     /// Shutdown all the running processes
-    pub(crate) async fn cleanup_all(&mut self) -> Result<()> {
+    pub(crate) async fn shutdown(&mut self) -> Result<()> {
         self.client.soft_kill().await;
 
         if let Some(server) = self.server.as_mut() {
@@ -574,6 +590,9 @@ impl AppServer {
                 );
             }
         }
+
+        // force the tailwind watcher to stop - if we don't, it eats our stdin
+        self.tw_watcher.abort();
 
         Ok(())
     }
@@ -676,6 +695,7 @@ impl AppServer {
         &mut self,
         build_id: BuildId,
         aslr_reference: Option<u64>,
+        pid: Option<u32>,
     ) {
         match build_id {
             BuildId::CLIENT => {
@@ -684,6 +704,9 @@ impl AppServer {
                 if self.client.build.platform != Platform::Web {
                     if let Some(aslr_reference) = aslr_reference {
                         self.client.aslr_reference = Some(aslr_reference);
+                    }
+                    if let Some(pid) = pid {
+                        self.client.pid = Some(pid);
                     }
                 }
             }
@@ -752,9 +775,13 @@ impl AppServer {
     /// we mostly just care about workspace files and local dependencies.
     ///
     /// Dep-info file background:
-    /// https://doc.rust-lang.org/stable/nightly-rustc/cargo/core/compiler/fingerprint/index.html#dep-info-files
+    /// <https://doc.rust-lang.org/stable/nightly-rustc/cargo/core/compiler/fingerprint/index.html#dep-info-files>
     fn load_rsx_filemap(&mut self) {
         self.fill_filemap_from_krate(self.client.build.crate_dir());
+
+        if let Some(server) = self.server.as_ref() {
+            self.fill_filemap_from_krate(server.build.crate_dir());
+        }
 
         for krate in self.all_watched_crates() {
             self.fill_filemap_from_krate(krate);
@@ -823,6 +850,17 @@ impl AppServer {
 
             if let Err(err) = self.watcher.watch(&path, RecursiveMode::Recursive) {
                 handle_notify_error(err);
+            }
+        }
+
+        if let Some(server) = self.server.as_ref() {
+            // Watch the server's crate directory as well
+            for path in self.watch_paths(server.build.crate_dir(), server.build.crate_package) {
+                tracing::trace!("Watching path {path:?}");
+
+                if let Err(err) = self.watcher.watch(&path, RecursiveMode::Recursive) {
+                    handle_notify_error(err);
+                }
             }
         }
 
@@ -936,6 +974,23 @@ impl AppServer {
             .chain(Some(crate_dir))
             .collect();
 
+        if let Some(server) = self.server.as_ref() {
+            let server_crate_package = server.build.crate_package;
+            let server_crate_dir = server.build.crate_dir();
+
+            let server_krates: Vec<PathBuf> = self
+                .local_dependencies(server_crate_package)
+                .into_iter()
+                .map(|p| {
+                    p.parent()
+                        .expect("Server manifest to exist and have a parent")
+                        .to_path_buf()
+                })
+                .chain(Some(server_crate_dir))
+                .collect();
+            krates.extend(server_krates);
+        }
+
         krates.dedup();
 
         krates
@@ -953,6 +1008,24 @@ impl AppServer {
         };
 
         server.compiled_crates as f64 / server.expected_crates as f64
+    }
+
+    pub(crate) async fn open_debugger(&mut self, dev: &WebServer, build: BuildId) {
+        if self.use_hotpatch_engine {
+            tracing::warn!("Debugging symbols might not work properly with hotpatching enabled. Consider disabling hotpatching for debugging.");
+        }
+
+        match build {
+            BuildId::CLIENT => {
+                _ = self.client.open_debugger(dev).await;
+            }
+            BuildId::SERVER => {
+                if let Some(server) = self.server.as_mut() {
+                    _ = server.open_debugger(dev).await;
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1038,9 +1111,9 @@ fn handle_notify_error(err: notify::Error) {
 
 /// Detects if `dx` is being ran in a WSL environment.
 ///
-/// We determine this based on whether the keyword `microsoft` or `wsl` is contained within the [`WSL_1`] or [`WSL_2`] files.
+/// We determine this based on whether the keyword `microsoft` or `wsl` is contained within the `WSL_1` or `WSL_2` files.
 /// This may fail in the future as it isn't guaranteed by Microsoft.
-/// See https://github.com/microsoft/WSL/issues/423#issuecomment-221627364
+/// See <https://github.com/microsoft/WSL/issues/423#issuecomment-221627364>
 fn is_wsl() -> bool {
     const WSL_1: &str = "/proc/sys/kernel/osrelease";
     const WSL_2: &str = "/proc/version";

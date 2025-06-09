@@ -106,7 +106,7 @@ impl RunArgs {
                             print!("{}", message);
                         }
                         BuilderUpdate::BuildFailed { err } => {
-                            tracing::error!("Build failed: {:#?}", err);
+                            tracing::error!("Build failed: {}", err);
                         }
                         BuilderUpdate::StdoutReceived { msg } => {
                             tracing::info!("[{platform}] {msg}");
@@ -123,6 +123,7 @@ impl RunArgs {
 
                             break;
                         }
+                        BuilderUpdate::ProcessWaitFailed { .. } => {}
                     }
                 }
                 _ => {}
